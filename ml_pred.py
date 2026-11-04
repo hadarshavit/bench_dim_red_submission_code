@@ -1,10 +1,15 @@
+from pathlib import Path
+from experiment_settings import ML_ALGORITHMS, ML_RED_DIMS, method_names, ml_evaluation_task_configs, ml_method_allowed_for_config, ml_pred_path, ml_reduced_path
+import os
+
 import openml
 from methods import methods
 import time
-import lzma
 import pickle
-import os
 import submitit
+import tempfile
+from ml_reduce import read_reduced
+from experiment_settings import ml_pred_path
 from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.compose import ColumnTransformer
@@ -18,6 +23,7 @@ from ConfigSpace.hyperparameters import CategoricalHyperparameter, \
     UniformFloatHyperparameter, UniformIntegerHyperparameter, OrdinalHyperparameter
 from ConfigSpace.conditions import EqualsCondition, InCondition
 from sklearn.metrics import accuracy_score, f1_score, balanced_accuracy_score
+
 from sklearn.model_selection import cross_val_score, KFold
 from smac import HyperparameterOptimizationFacade, Scenario
 
@@ -84,43 +90,92 @@ def get_gb_cs():
     ])
     return cs
 
+
+def get_classifier_configspace(algo):
+    if algo == 'rf':
+        return get_rf_cs()
+    if algo == 'gb':
+        return get_gb_cs()
+    if algo == 'mlp':
+        return get_nn_cs()
+    raise ValueError(f"Unknown ML prediction algorithm: {algo}")
+
+
+def make_classifier(algo, config):
+    if algo == 'rf':
+        classifier = RandomForestClassifier(
+            n_estimators=config["n_estimators"],
+            max_features=config["max_features"],
+            min_samples_split=config["min_samples_split"],
+            min_samples_leaf=config["min_samples_leaf"],
+            bootstrap=config["bootstrap"],
+            random_state=42,
+        )
+    elif algo == 'gb':
+        classifier = HistGradientBoostingClassifier(
+            max_depth=config["max_depth"],
+            max_leaf_nodes=config["max_leaf_nodes"],
+            learning_rate=config["learning_rate"],
+            l2_regularization=config["l2_regularization"],
+            random_state=42,
+        )
+    elif algo == 'mlp':
+        classifier = MLPClassifier(
+            hidden_layer_sizes=(config['width'],) * config['depth'],
+            alpha=config['alpha'],
+            learning_rate_init=config['learning_rate_init'],
+            random_state=42,
+        )
+    else:
+        raise ValueError(f"Unknown ML prediction algorithm: {algo}")
+    return make_pipeline(SimpleImputer(strategy="median"), classifier)
+
+
+def tune_classifier(Xtrain, Ytrain, algo):
+    cs = get_classifier_configspace(algo)
+
+    def train(config, seed):
+        try:
+            model = make_classifier(algo, config)
+            score = float(np.mean(cross_val_score(
+                model,
+                Xtrain,
+                Ytrain,
+                error_score='raise',
+                scoring='accuracy',
+                cv=KFold(n_splits=3, shuffle=True, random_state=42),
+            )))
+        except (FloatingPointError, ValueError):
+            return 1.0
+        return 1.0 - score if np.isfinite(score) else 1.0
+
+    with tempfile.TemporaryDirectory(prefix="ml_pred_smac_") as output_directory:
+        scenario = Scenario(
+            configspace=cs,
+            output_directory=output_directory,
+            deterministic=True,
+            n_trials=30,
+            seed=0,
+        )
+        return HyperparameterOptimizationFacade(
+            scenario=scenario,
+            target_function=train,
+            overwrite=True,
+        ).optimize()
+
+
 def reduce(task_id, cv, method_name, n_components, algo):
+    result_path = ml_pred_path(task_id, cv, method_name, n_components, algo)
+    if result_path.exists():
+        return
+    result_path.parent.mkdir(parents=True, exist_ok=True)
     task = openml.tasks.get_task(task_id, download_splits=False)
     train_indices, test_indices = task.get_train_test_split_indices(
                 repeat=0,
                 fold=cv,
                 sample=0,
             )
-    df = pd.read_parquet(f"benchmark_dim_red/ml_data_reduced/{task_id}_{cv}_{method_name}_{n_components}.parquet.xz")
-
-    if algo == 'rf':
-        clf = RandomForestClassifier
-    elif algo == 'gb':
-        clf = HistGradientBoostingClassifier
-    elif algo == 'mlp':
-        clf = MLPClassifier
-
-    def train(config, seed):
-        if algo == 'rf':
-            model = RandomForestClassifier(n_estimators=config["n_estimators"],
-                                                max_features=config["max_features"],
-                                                min_samples_split=config["min_samples_split"],
-                                                min_samples_leaf=config["min_samples_leaf"],
-                                                bootstrap=config["bootstrap"],
-                                                random_state=42)
-        elif algo == 'gb':
-            model = HistGradientBoostingClassifier(max_depth=config["max_depth"],
-                                                    max_leaf_nodes=config["max_leaf_nodes"],
-                                                    learning_rate=config["learning_rate"],
-                                                    l2_regularization=config["l2_regularization"],
-                                                    random_state=42)
-        elif algo == 'mlp':
-            model = MLPClassifier(hidden_layer_sizes=(config['width'],)*config['depth'],
-                                  alpha=config['alpha'],
-                                  learning_rate_init=config['learning_rate_init'],
-                                  random_state=42)
-        
-        return -np.mean(cross_val_score(model, Xtrain, Ytrain, error_score='raise', scoring='accuracy', cv=KFold(n_splits=3, shuffle=True, random_state=42)))
+    df = read_reduced(task_id, cv, method_name, n_components)
 
     X = df.values
     Y = task.get_dataset().get_data(target=task.target_name)[1]
@@ -130,43 +185,8 @@ def reduce(task_id, cv, method_name, n_components, algo):
     Xtest = X[test_indices]
     Ytest = Y[test_indices]
 
-    if algo == 'rf':
-        cs = get_rf_cs()
-    elif algo == 'gb':
-        cs = get_gb_cs()
-    elif algo == 'mlp':
-        cs = get_nn_cs()
-
-    s = Scenario(
-        configspace=cs,
-        output_directory=f'benchmark_dim_red/ml_data_reduced/smac/{task_id}_{cv}_{method_name}_{n_components}',
-        deterministic=True,
-        n_trials=30,
-        seed=0
-    )
-
-    smac = HyperparameterOptimizationFacade(scenario=s, target_function=train, overwrite=True)
-    inc = smac.optimize()
-
-    if algo == 'rf':
-        clf = RandomForestClassifier(n_estimators=inc["n_estimators"],
-                                            max_features=inc["max_features"],
-                                            min_samples_split=inc["min_samples_split"],
-                                            min_samples_leaf=inc["min_samples_leaf"],
-                                            bootstrap=inc["bootstrap"],
-                                            random_state=42)
-    elif algo == 'gb':
-        clf = HistGradientBoostingClassifier(max_depth=inc["max_depth"],
-                                                max_leaf_nodes=inc["max_leaf_nodes"],
-                                                learning_rate=inc["learning_rate"],
-                                                l2_regularization=inc["l2_regularization"],
-                                                random_state=42)
-    elif algo == 'mlp':
-        clf = MLPClassifier(hidden_layer_sizes=(inc['width'],)*inc['depth'],
-                            alpha=inc['alpha'],
-                            learning_rate_init=inc['learning_rate_init'],
-                            random_state=42)
-        
+    inc = tune_classifier(Xtrain, Ytrain, algo)
+    clf = make_classifier(algo, inc)
     clf.fit(Xtrain, Ytrain)
 
     Ypred = clf.predict(Xtest)
@@ -174,70 +194,28 @@ def reduce(task_id, cv, method_name, n_components, algo):
     f1 = f1_score(Ytest, Ypred, average='weighted')
     bal_acc = balanced_accuracy_score(Ytest, Ypred)
 
-    with lzma.open(f"benchmark_dim_red/ml_data_reduced/{task_id}_{cv}_{method_name}_{n_components}_{algo}_mlpred.pkl.xz", "wb") as file:
-        pickle.dump([acc, f1, bal_acc, clf, inc], file)
-
-
-def parallel_executor(task_id, cv, algo):
-    os.makedirs(
-        f"benchmark_dim_red/ml_data_reduced/{task_id}_{cv}", exist_ok=True
-    )
-    for method_name in methods.keys():
-        for n_components in [5, 10, 20, 40]:
-            if os.path.exists(f"benchmark_dim_red/ml_data_reduced/{task_id}_{cv}_{method_name}_{n_components}_{algo}_mlpred.pkl.xz"):
-                continue
-            try:
-                reduce(task_id, cv, method_name, n_components, algo)
-            except Exception as e:
-                print(e)
+    temporary_path = result_path.with_name(f".{result_path.name}.{os.getpid()}.tmp")
+    try:
+        Path(temporary_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(temporary_path, "wb") as file:
+            pickle.dump([acc, f1, bal_acc, clf, inc], file)
+        os.replace(temporary_path, result_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
-    executor = submitit.AutoExecutor('benchmark_dim_red/logs_ml', 'slurm')
-    executor.update_parameters(
-        timeout_min=60*48,
-        slurm_partition="PARTITION" ,
-        slurm_array_parallelism=1024,
-        cpus_per_task=1,
-        mem_gb=2.8 * 1, 
-        tasks_per_node=1,
-        slurm_job_name="m_dim_red",
-        slurm_setup=["module -q load GCCcore/.12.2.0", "module -q load Python/3.10.8", 
-                    "export PYTHONPATH=/benchmark_dim_red",
-                    "export OMP_NUM_THREADS=1",
-                    "export OPENBLAS_NUM_THREADS=1",
-                    "export MKL_NUM_THREADS=1",
-                    "export BLIS_NUM_THREADS=1",
-                    "source /venvs/bench_dim_red/bin/activate"],
-        slurm_additional_parameters={"account": "ACCOUNT"},
-    )
-
-
-    with executor.collect_jobs():
-        suite = openml.study.get_suite(99)
-        print(suite)
-        cnt = 0
-        for task_id in suite.tasks:
-            task = openml.tasks.get_task(task_id, download_splits=False)
-            data, targets, categorical, attribute_names = task.get_dataset().get_data(target=task.target_name)
-            if data.shape[1] <= 20:
-                continue    
-            for cv in range(1, 10):
-                
-                for method_name in methods.keys():
-                    for n_components in [5, 10, 20, 40]:
-                        if data.shape[1] <= n_components:
+    executor = submitit.AutoExecutor("logs/ml_pred", cluster="slurm")
+    executor.update_parameters(timeout_min=24 * 60, cpus_per_task=1, mem_gb=2.8)
+    with executor.batch():
+        (method_names_, _) = method_names()
+        for (task_id, folds, n_features, n_instances) in ml_evaluation_task_configs():
+            for cv in range(folds):
+                for method_name in method_names_:
+                    for red_dim in ML_RED_DIMS:
+                        if n_features <= red_dim or not ml_method_allowed_for_config(method_name, n_instances, red_dim):
                             continue
-                        if data.shape[0] > 10_000:
-                            continue
-                        
-                        for algo in ['rf', 'gb', 'mlp']:
-                            if os.path.exists(f"benchmark_dim_red/ml_data_reduced/{task_id}_{cv}_{method_name}_{n_components}_{algo}_mlpred.pkl.xz"):
-                                continue
-                            print(f'benchmark_dim_red/ml_data_reduced/{task_id}_{cv}_{method_name}_{n_components}_{algo}_mlpred.pkl.xz')
-                            executor.submit(reduce, task_id, cv, method_name, n_components, algo)
-                        
-    
-    executor.submit_progressively(50, 50, 60)
-
-
+                        reduced = ml_reduced_path(task_id, cv, method_name, red_dim)
+                        for algorithm in ML_ALGORITHMS:
+                            if not os.path.exists(ml_pred_path(task_id, cv, method_name, red_dim, algorithm)) and os.path.exists(reduced):
+                                executor.submit(reduce, task_id, cv, method_name, red_dim, algorithm)

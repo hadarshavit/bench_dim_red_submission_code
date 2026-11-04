@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+results/
+logs/
+figures/
+*.duck
+*.duck.lock
+.env
+real_world_benchs/CT_slice_*.npy*
+real_world_benchs/mopta08_*.bin
+real_world_benchs/mopta08_*.exe

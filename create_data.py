@@ -1,8 +1,8 @@
+from pathlib import Path
 import numpy as np
 import os
 from ioh import get_problem, ProblemClass
-from pflacco.sampling import create_initial_sample
-import lzma
+from sampling import create_initial_sample
 import pickle
 from concurrent.futures import ProcessPoolExecutor
 
@@ -14,7 +14,8 @@ def execute(fid, inpt_dim, instance, sample):
 
     y = x.apply(lambda u: f(u), axis = 1)
 
-    with lzma.open(f'/benchmark_dim_red/{sample}/data_orig/{fid}/{inpt_dim}/{instance}.pkl.xz', 'wb') as file:
+    Path(f'results/{sample}/data_orig/{fid}/{inpt_dim}/{instance}.pkl').parent.mkdir(parents=True, exist_ok=True)
+    with open(f'results/{sample}/data_orig/{fid}/{inpt_dim}/{instance}.pkl', 'wb') as file:
         pickle.dump((x, y), file)
 
 if __name__ == '__main__':
@@ -23,6 +24,6 @@ if __name__ == '__main__':
         for fid in range(1, 25):
             for inpt_dim in [20, 40, 60, 120, 240, 500, 1000]:
                 for instance in range(0, 31):
-                    os.makedirs(f'/benchmark_dim_red/{sample}/data_orig/{fid}/{inpt_dim}', exist_ok=True)
+                    os.makedirs(f'results/{sample}/data_orig/{fid}/{inpt_dim}', exist_ok=True)
                     executor.submit(execute, fid, inpt_dim, instance, sample)
         executor.shutdown(wait=True)

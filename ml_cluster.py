@@ -1,17 +1,21 @@
+from pathlib import Path
+from experiment_settings import ML_RED_DIMS, method_names, ml_cluster_path, ml_evaluation_task_configs, ml_method_allowed_for_config, ml_reduced_path
+import os
+
 import openml
 from methods import methods
 import time
-import lzma
 import pickle
-import os
 import submitit
+from ml_reduce import read_reduced
+from experiment_settings import ml_cluster_path
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, OrdinalEncoder
 from sklearn.impute import SimpleImputer
 import numpy as np
 import pandas as pd
-import hdbscan
+from sklearn.cluster import HDBSCAN
 from sklearn.metrics.cluster import adjusted_rand_score, \
     adjusted_mutual_info_score, homogeneity_completeness_v_measure, fowlkes_mallows_score, \
         silhouette_score, calinski_harabasz_score
@@ -19,7 +23,11 @@ from sklearn.metrics.cluster import adjusted_rand_score, \
 
 def reduce(task_id, cv, method_name, n_components):
     print(task_id, cv, method_name, n_components, flush=True)
-    df = pd.read_parquet(f"benchmark_dim_red/ml_data_reduced/{task_id}_{cv}_{method_name}_{n_components}.parquet.xz")
+    result_path = ml_cluster_path(task_id, cv, method_name, n_components)
+    if result_path.exists():
+        return
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    df = read_reduced(task_id, cv, method_name, n_components)
 
     task = openml.tasks.get_task(task_id, download_splits=False)
     train_indices, test_indices = task.get_train_test_split_indices(
@@ -27,7 +35,7 @@ def reduce(task_id, cv, method_name, n_components):
                 fold=cv,
                 sample=0,
             )
-    
+
     X = df.values
     Y = task.get_dataset().get_data(target=task.target_name)[1]
 
@@ -36,7 +44,7 @@ def reduce(task_id, cv, method_name, n_components):
     Xtest = X[test_indices]
     Ytest = Y[test_indices]
 
-    dbscan = hdbscan.HDBSCAN()
+    dbscan = HDBSCAN()
     labels = dbscan.fit_predict(Xtest)
 
     ari = adjusted_rand_score(Ytest, labels)
@@ -44,60 +52,28 @@ def reduce(task_id, cv, method_name, n_components):
     hcv = homogeneity_completeness_v_measure(Ytest, labels)
     fms = fowlkes_mallows_score(Ytest, labels)
 
-    with lzma.open(f"benchmark_dim_red/ml_data_reduced/{task_id}_{cv}_{method_name}_{n_components}_cluster.pkl.xz", "wb") as file:
-        pickle.dump([ari, ami, hcv, fms], file)
+
+    temporary_path = result_path.with_name(f".{result_path.name}.{os.getpid()}.tmp")
+    try:
+        Path(temporary_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(temporary_path, "wb") as file:
+            pickle.dump([ari, ami, hcv, fms], file)
+        os.replace(temporary_path, result_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
-def parallel_executor(task_id, cv):
-     for method_name in methods.keys():
-        for n_components in [5, 10, 20, 40]:
-            if os.path.exists(f"benchmark_dim_red/ml_data_reduced/{task_id}_{cv}_{method_name}_{n_components}_cluster.pkl.xz"):
-                continue
-            try:
-                reduce(task_id, cv, method_name, n_components)
-            except Exception as e:
-                print(e)
-                pass
-
-
-if __name__ == '__main__':
-    executor = submitit.AutoExecutor('benchmark_dim_red/logs_ml', 'slurm')
-    executor.update_parameters(
-        timeout_min=60*48,
-        slurm_partition="PARTITION" ,
-        slurm_array_parallelism=1024,
-        cpus_per_task=1,
-        mem_gb=2.8 * 1, 
-        tasks_per_node=1,
-        slurm_job_name="cluster",
-        slurm_setup=["module -q load GCCcore/.12.2.0", "module -q load Python/3.10.8", 
-                    "export PYTHONPATH=/benchmark_dim_red",
-                    "export OMP_NUM_THREADS=1",
-                    "export OPENBLAS_NUM_THREADS=1",
-                    "export MKL_NUM_THREADS=1",
-                    "export BLIS_NUM_THREADS=1",
-                    "source /venvs/bench_dim_red/bin/activate"],
-        slurm_additional_parameters={"account": "ACCOUNT"},
-    )
-
+if __name__ == "__main__":
+    executor = submitit.AutoExecutor("logs/ml_cluster", cluster="slurm")
+    executor.update_parameters(timeout_min=24 * 60, cpus_per_task=1, mem_gb=2.8)
     with executor.batch():
-        suite = openml.study.get_suite(99)
-        print(suite)
-        cnt = 0
-        for task_id in suite.tasks:
-            task = openml.tasks.get_task(task_id, download_splits=False)
-            data, targets, categorical, attribute_names = task.get_dataset().get_data(target=task.target_name)
-            if data.shape[1] <= 20:
-                continue    
-            for cv in range(1, 10):
-                
-                for method_name in methods.keys():
-                    for n_components in [5, 10, 20, 40]:
-                        if data.shape[1] <= n_components:
+        (method_names_, _) = method_names()
+        for (task_id, folds, n_features, n_instances) in ml_evaluation_task_configs():
+            for cv in range(folds):
+                for method_name in method_names_:
+                    for red_dim in ML_RED_DIMS:
+                        if n_features <= red_dim or not ml_method_allowed_for_config(method_name, n_instances, red_dim):
                             continue
-                        if data.shape[0] > 10_000:
-                            continue
-                        if os.path.exists(f"benchmark_dim_red/ml_data_reduced/{task_id}_{cv}_{method_name}_{n_components}_cluster.pkl.xz"):
-                            continue
-                        print(f'benchmark_dim_red/ml_data_reduced/{task_id}_{cv}_{method_name}_{n_components}.parquet.xz')
-                        executor.submit(reduce, task_id, cv, method_name, n_components)
+                        reduced = ml_reduced_path(task_id, cv, method_name, red_dim)
+                        if not os.path.exists(ml_cluster_path(task_id, cv, method_name, red_dim)) and os.path.exists(reduced):
+                            executor.submit(reduce, task_id, cv, method_name, red_dim)

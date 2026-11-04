@@ -1,3 +1,5 @@
+from pathlib import Path
+from experiment_settings import BASE_DIR, CV_FOLDS, expected_synthetic_reducers, method_weight
 import pandas as pd
 import numpy as np
 from ConfigSpace import ConfigurationSpace
@@ -10,43 +12,43 @@ from sklearn.metrics import mean_squared_error
 from smac import HyperparameterOptimizationFacade, Scenario
 import submitit
 from methods import methods, with_weight
-import lzma
 import pickle
 from sklearn.preprocessing import MinMaxScaler
 import os
+import tempfile
 from ioh import get_problem, ProblemClass
-from pflacco.sampling import create_initial_sample
+from sampling import create_initial_sample
 
 
 def execute(fid, method_name, instance, inpt_dim, red_dim, cv, sample):
     weight = method_name in with_weight
-    if os.path.exists(f'benchmark_dim_red/{sample}/epm/res/{fid}/{inpt_dim}/{instance}_{method_name}_{red_dim}_{weight}_{cv}.pkl.xz'):
+    if os.path.exists(f'results/{sample}/epm/res/{fid}/{inpt_dim}/{instance}_{method_name}_{red_dim}_{weight}_{cv}.pkl'):
         return
-    
+
     f = get_problem(fid=fid, dimension=inpt_dim, instance=instance, problem_class=ProblemClass.BBOB)
     x_orig = create_initial_sample(inpt_dim, sample_type = 'sobol', n=min(50 * inpt_dim, 5000), lower_bound=-5, upper_bound=5, seed=1)
 
     y = x_orig.apply(lambda u: f(u), axis = 1).values
     method_class = methods[method_name]
     reducer = method_class(n_components=red_dim)
-    reducer.load(f"benchmark_dim_red/{sample}/data_reduced/{fid}/{inpt_dim}/{method_name}_{red_dim}_{instance}_{weight}_reducer.pkl.xz")
+    reducer.load(f"results/{sample}/data_reduced/{fid}/{inpt_dim}/{method_name}_{red_dim}_{instance}_{weight}_reducer.pkl")
     x = reducer.transform(x_orig)
-    
+
     kf = KFold(n_splits=5)
     for i, (train_index, test_index) in enumerate(kf.split(x)):
          if i == cv:
               break
-         
+
     Xtrain = x[train_index]
     Xtest = x[test_index]
     scaler = MinMaxScaler((1e-5 , 1))
     y = y.reshape(-1, 1)
 
     Ytrain = scaler.fit_transform(y[train_index])
-    Ytrain[Ytrain < 1e-5] = 1e-5 
+    Ytrain[Ytrain < 1e-5] = 1e-5
     Ytrain = np.log10(Ytrain).reshape(-1)
     Ytest = scaler.transform(y[test_index])
-    Ytest[Ytest < 1e-5] = 1e-5 
+    Ytest[Ytest < 1e-5] = 1e-5
     Ytest = np.log10(Ytest).reshape(-1)
 
     cs = ConfigurationSpace()
@@ -74,20 +76,22 @@ def execute(fid, method_name, instance, inpt_dim, red_dim, cv, sample):
                                             min_samples_leaf=config["min_samples_leaf"],
                                             bootstrap=config["bootstrap"],
                                             random_state=42)
-        
+
         return -np.mean(cross_val_score(model, Xtrain, Ytrain, error_score='raise', scoring='neg_mean_squared_error', cv=KFold(n_splits=3, shuffle=True, random_state=42)))
 
 
-    s = Scenario(
-        configspace=cs,
-        output_directory=f'benchmark_dim_red/{sample}/epm/smac_out/{fid}/{inpt_dim}/{instance}_{method_name}_{red_dim}_{weight}_{cv}.pkl.xz',
-        deterministic=True,
-        n_trials=30,
-        seed=0
-    )
+    with tempfile.TemporaryDirectory(prefix="epm_") as smac_tmp:
+        s = Scenario(
+            configspace=cs,
+            output_directory=smac_tmp,
+            deterministic=True,
 
-    smac = HyperparameterOptimizationFacade(scenario=s, target_function=train, overwrite=True)
-    inc = smac.optimize()
+            n_trials=30,
+            seed=0,
+        )
+
+        smac = HyperparameterOptimizationFacade(scenario=s, target_function=train, overwrite=True)
+        inc = smac.optimize()
 
     model = RandomForestRegressor(n_estimators=inc["n_estimators"],
                                             max_features=inc["max_features"],
@@ -98,58 +102,23 @@ def execute(fid, method_name, instance, inpt_dim, red_dim, cv, sample):
     model.fit(Xtrain, Ytrain)
     preds = model.predict(Xtest)
     mse = mean_squared_error(Ytest, preds)
-    with lzma.open(
-        f'benchmark_dim_red/{sample}/epm/res/{fid}/{inpt_dim}/{instance}_{method_name}_{red_dim}_{weight}_{cv}.pkl.xz',
+    Path(f'results/{sample}/epm/res/{fid}/{inpt_dim}/{instance}_{method_name}_{red_dim}_{weight}_{cv}.pkl').parent.mkdir(parents=True, exist_ok=True)
+    with open(
+        f'results/{sample}/epm/res/{fid}/{inpt_dim}/{instance}_{method_name}_{red_dim}_{weight}_{cv}.pkl',
         "wb",
     ) as file:
         pickle.dump(dict(
-            model=model, inc=inc, mse=mse, preds=preds), 
+            model=model, inc=inc, mse=mse, preds=preds),
             file)
 
 
-def execute_parallel(fid, sample, inpt_dim):
-    for instance in range(0, 31):
-        for red_dim in [5, 10, 20, 40]:
-            if inpt_dim > red_dim:
-                for method_name, method_class in methods.items():
-                    for cv in range(5):
-                        weight = method_name in with_weight
-                        os.makedirs(f'benchmark_dim_red/{sample}/epm/res/{fid}/{inpt_dim}', exist_ok=True)
-                        if os.path.exists(f'benchmark_dim_red/{sample}/epm/res/{fid}/{inpt_dim}/{instance}_{method_name}_{red_dim}_{weight}_{cv}.pkl.xz'):
-                            continue
-                        try:
-                            execute(fid, method_name, instance, inpt_dim, red_dim, cv, sample)
-                        except Exception as e:
-                            print(e)
-                            continue
-
-
-if __name__ == '__main__':
-    execute(15, 'isomap', 26, 500, 10, 0, 1000)
-    execute(15, 'isomap', 26, 500, 10, 1, 1000)
-    execute(15, 'isomap', 26, 500, 10, 2, 1000)
-    execute(15, 'isomap', 26, 500, 10, 3, 1000)
-    execute(15, 'isomap', 26, 500, 10, 4, 1000)
-    exit()
-
-
-    for sample in [1000]:
-        cnt = 0
-        for fid in [24]:
-            for inpt_dim in [20, 40, 60, 120, 240, 500, 1000]:
-                for instance in range(0, 31):
-                    for red_dim in [5, 10, 20, 40]:
-                        if inpt_dim > red_dim:
-                            for method_name, method_class in methods.items():
-                                for cv in range(5):
-                                    weight = method_name in with_weight
-                                    os.makedirs(f'benchmark_dim_red/{sample}/epm/res/{fid}/{inpt_dim}', exist_ok=True)
-                                    if os.path.exists(f'benchmark_dim_red/{sample}/epm/res/{fid}/{inpt_dim}/{instance}_{method_name}_{red_dim}_{weight}_{cv}.pkl.xz'):
-                                        continue
-                                    try:
-                                        executor.submit(execute, fid, method_name, instance, inpt_dim, red_dim, cv, sample)
-                                    except Exception as e:
-                                        print(e)
-                                        continue
-    exit()
-
+if __name__ == "__main__":
+    executor = submitit.AutoExecutor("logs/epm", cluster="slurm")
+    executor.update_parameters(timeout_min=24 * 60, cpus_per_task=1, mem_gb=2.8)
+    with executor.batch():
+        for (sample, fid, inpt_dim, method_name, red_dim, instance, reducer) in expected_synthetic_reducers():
+            weight = method_weight(method_name)
+            for cv in CV_FOLDS:
+                result = BASE_DIR / str(sample) / 'epm' / 'res' / str(fid) / str(inpt_dim) / f'{instance}_{method_name}_{red_dim}_{weight}_{cv}.pkl'
+                if not os.path.exists(result) and os.path.exists(reducer):
+                    executor.submit(execute, fid, method_name, instance, inpt_dim, red_dim, cv, sample)

@@ -1,0 +1,2 @@
+LassoBench
+gymnasium[mujoco]
